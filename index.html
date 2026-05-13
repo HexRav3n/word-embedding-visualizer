@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Word Embedding Visualizer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg: #0e1116;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --grid: #21262d;
+    --arrow: #58a6ff;
+    --warm: #f78166;
+    --cool: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 22px; margin: 0 0 4px 0; }
+  p.lede { color: var(--muted); margin: 0 0 20px 0; font-size: 14px; line-height: 1.5; }
+  .controls { display: flex; gap: 12px; margin-bottom: 16px; align-items: stretch; }
+  textarea {
+    flex: 1; min-height: 56px; padding: 10px 12px; resize: vertical;
+    background: #161b22; color: var(--fg); border: 1px solid #30363d;
+    border-radius: 6px; font: 14px ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  button {
+    background: var(--accent); color: #0e1116; border: 0; border-radius: 6px;
+    padding: 10px 18px; font-weight: 600; cursor: pointer; font-size: 14px;
+    min-width: 110px;
+  }
+  button:disabled { opacity: 0.5; cursor: progress; }
+  #status { color: var(--muted); font-size: 13px; min-height: 20px; margin-bottom: 12px;
+    font-family: ui-monospace, monospace; }
+  .plot-row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
+    align-items: start; }
+  @media (max-width: 800px) { .plot-row { grid-template-columns: 1fr; } }
+  svg { background: #0b0f14; border: 1px solid #21262d; border-radius: 8px; width: 100%; height: auto; }
+  .panel h2 { font-size: 14px; color: var(--muted); margin: 0 0 8px 0; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.05em; }
+  table { border-collapse: collapse; font-size: 12px;
+    font-family: ui-monospace, monospace; width: 100%; }
+  th, td { padding: 4px 6px; text-align: center; border: 1px solid #21262d; }
+  th { color: var(--muted); font-weight: 500; background: #161b22; }
+  td.diag { background: #161b22; color: var(--muted); }
+  .footnote { color: var(--muted); font-size: 12px; margin-top: 24px; line-height: 1.6; }
+  .footnote code { background: #161b22; padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Word Embedding Visualizer</h1>
+  <p class="lede">
+    Enter comma-separated words. Each word is converted into a 384-dimensional vector by a real
+    sentence-embedding model running entirely in your browser (no API). The vectors are then
+    projected to 3D using PCA and drawn as arrows from the origin. Click and drag the plot to
+    rotate the view. Cosine similarity for every pair is shown on the right.
+  </p>
+
+  <div class="controls">
+    <textarea id="words" spellcheck="false">dog, puppy, cat, kitten, car, truck, bicycle, happy, sad, joyful</textarea>
+    <button id="go">Embed</button>
+  </div>
+  <div id="status">Idle. Click "Embed" to load the model and compute vectors. First load downloads ~25 MB.</div>
+
+  <div class="plot-row">
+    <div class="panel">
+      <h2>3D Projection (PCA of 384D embeddings &middot; drag to rotate)</h2>
+      <svg id="plot" viewBox="-300 -300 600 600" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+    <div class="panel">
+      <h2>Cosine Similarity (in full 384D space)</h2>
+      <div id="matrix"></div>
+    </div>
+  </div>
+
+  <div class="footnote">
+    The arrows live in 384 dimensions; what you see is a shadow cast onto the three directions
+    where the words vary the most. Pairs with high cosine similarity (closer to 1.0) point in
+    similar directions in the real space, even if the 2D shadow looks misleading.<br>
+    Model: <code>Xenova/all-MiniLM-L6-v2</code> via transformers.js. If file:// blocks the import,
+    serve the folder with <code>python3 -m http.server</code> and open <code>http://localhost:8000</code>.
+  </div>
+</div>
+
+<script type="module">
+import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2";
+env.allowLocalModels = false;
+
+const $ = id => document.getElementById(id);
+const statusEl = $("status");
+const setStatus = m => { statusEl.textContent = m; };
+
+let extractor = null;
+
+async function getExtractor() {
+  if (extractor) return extractor;
+  setStatus("Loading embedding model (first time only)...");
+  extractor = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
+    progress_callback: p => {
+      if (p.status === "progress" && p.file) {
+        const pct = p.progress ? p.progress.toFixed(0) : "?";
+        setStatus(`Downloading ${p.file}: ${pct}%`);
+      }
+    }
+  });
+  return extractor;
+}
+
+async function embed(words) {
+  const ex = await getExtractor();
+  setStatus("Computing embeddings...");
+  const vecs = [];
+  for (const w of words) {
+    const out = await ex(w, { pooling: "mean", normalize: true });
+    vecs.push(Array.from(out.data));
+  }
+  return vecs;
+}
+
+function meanVec(M) {
+  const d = M[0].length, n = M.length;
+  const m = new Array(d).fill(0);
+  for (const row of M) for (let i = 0; i < d; i++) m[i] += row[i];
+  for (let i = 0; i < d; i++) m[i] /= n;
+  return m;
+}
+
+function center(M, m) {
+  return M.map(row => row.map((v, i) => v - m[i]));
+}
+
+function dot(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+function norm(a) { return Math.sqrt(dot(a, a)); }
+
+function normalize(a) {
+  const n = norm(a) || 1;
+  return a.map(x => x / n);
+}
+
+function powerIteration(C_apply, dim, iters = 100) {
+  let v = new Array(dim).fill(0).map(() => Math.random() - 0.5);
+  v = normalize(v);
+  for (let k = 0; k < iters; k++) {
+    v = normalize(C_apply(v));
+  }
+  return v;
+}
+
+function topThreePCs(Xc) {
+  const n = Xc.length, d = Xc[0].length;
+  const applyCov = v => {
+    const Xv = new Array(n);
+    for (let i = 0; i < n; i++) Xv[i] = dot(Xc[i], v);
+    const r = new Array(d).fill(0);
+    for (let i = 0; i < n; i++) {
+      const xi = Xc[i], s = Xv[i];
+      for (let j = 0; j < d; j++) r[j] += xi[j] * s;
+    }
+    for (let j = 0; j < d; j++) r[j] /= (n - 1);
+    return r;
+  };
+  const deflate = (v, bases) => {
+    let out = v.slice();
+    for (const b of bases) {
+      const p = dot(out, b);
+      for (let i = 0; i < out.length; i++) out[i] -= p * b[i];
+    }
+    return out;
+  };
+  const pc1 = powerIteration(applyCov, d);
+  const pc2 = powerIteration(v => deflate(applyCov(deflate(v, [pc1])), [pc1]), d);
+  const pc3 = powerIteration(v => deflate(applyCov(deflate(v, [pc1, pc2])), [pc1, pc2]), d);
+  return [pc1, pc2, pc3];
+}
+
+function project3D(Xc, pc1, pc2, pc3) {
+  return Xc.map(row => [dot(row, pc1), dot(row, pc2), dot(row, pc3)]);
+}
+
+function cosine(a, b) {
+  return dot(a, b) / ((norm(a) * norm(b)) || 1);
+}
+
+const palette = ["#58a6ff", "#f78166", "#3fb950", "#d29922", "#bc8cff",
+                 "#ff7b72", "#79c0ff", "#a5d6ff", "#56d364", "#e3b341"];
+
+const view = {
+  words: [],
+  points3D: [],
+  rotX: -0.35,
+  rotY: 0.6,
+  autoSpin: true,
+  dragging: false,
+  lastX: 0,
+  lastY: 0,
+};
+
+function rotate3D(p, rx, ry) {
+  let [x, y, z] = p;
+  const cy = Math.cos(ry), sy = Math.sin(ry);
+  const x1 = x * cy + z * sy;
+  const z1 = -x * sy + z * cy;
+  const cx = Math.cos(rx), sx = Math.sin(rx);
+  const y2 = y * cx - z1 * sx;
+  const z2 = y * sx + z1 * cx;
+  return [x1, y2, z2];
+}
+
+function drawScene() {
+  const svg = $("plot");
+  const { words, points3D, rotX, rotY } = view;
+  svg.innerHTML = "";
+
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  defs.innerHTML = `
+    <marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+    </marker>`;
+  svg.appendChild(defs);
+
+  const grid = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  const axes = [
+    { v: [1, 0, 0], label: "PC1", color: "#484f58" },
+    { v: [0, 1, 0], label: "PC2", color: "#484f58" },
+    { v: [0, 0, 1], label: "PC3", color: "#484f58" },
+  ];
+  const axisLen = 260;
+  for (const ax of axes) {
+    const tip = rotate3D(ax.v.map(c => c * axisLen), rotX, rotY);
+    const negTip = rotate3D(ax.v.map(c => -c * axisLen), rotX, rotY);
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", negTip[0]); line.setAttribute("y1", -negTip[1]);
+    line.setAttribute("x2", tip[0]);    line.setAttribute("y2", -tip[1]);
+    line.setAttribute("stroke", ax.color);
+    line.setAttribute("stroke-width", "0.8");
+    line.setAttribute("stroke-dasharray", "3 4");
+    grid.appendChild(line);
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    label.setAttribute("x", tip[0]); label.setAttribute("y", -tip[1]);
+    label.setAttribute("fill", "#6e7681");
+    label.setAttribute("font-size", "10");
+    label.setAttribute("font-family", "ui-monospace, monospace");
+    label.textContent = ax.label;
+    grid.appendChild(label);
+  }
+  svg.appendChild(grid);
+
+  if (points3D.length === 0) return;
+
+  const maxAbs = Math.max(
+    1e-9,
+    ...points3D.flatMap(p => [Math.abs(p[0]), Math.abs(p[1]), Math.abs(p[2])])
+  );
+  const scale = 240 / maxAbs;
+
+  const items = points3D.map((p, i) => {
+    const scaled = [p[0] * scale, p[1] * scale, p[2] * scale];
+    const r = rotate3D(scaled, rotX, rotY);
+    return { i, x: r[0], y: -r[1], z: r[2] };
+  });
+  items.sort((a, b) => a.z - b.z);
+
+  for (const it of items) {
+    const color = palette[it.i % palette.length];
+    const depth = (it.z + 240) / 480;
+    const opacity = 0.45 + 0.55 * depth;
+    const strokeW = 1.2 + 1.6 * depth;
+
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.setAttribute("color", color);
+
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", 0); line.setAttribute("y1", 0);
+    line.setAttribute("x2", it.x); line.setAttribute("y2", it.y);
+    line.setAttribute("stroke", color);
+    line.setAttribute("stroke-width", strokeW);
+    line.setAttribute("opacity", opacity);
+    line.setAttribute("marker-end", "url(#arrowhead)");
+    g.appendChild(line);
+
+    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    const off = 12;
+    text.setAttribute("x", it.x + (it.x >= 0 ? off : -off));
+    text.setAttribute("y", it.y + (it.y >= 0 ? off : -off / 2));
+    text.setAttribute("fill", color);
+    text.setAttribute("opacity", opacity);
+    text.setAttribute("font-size", 11 + 3 * depth);
+    text.setAttribute("font-family", "ui-monospace, monospace");
+    text.setAttribute("text-anchor", it.x >= 0 ? "start" : "end");
+    text.textContent = words[it.i];
+    g.appendChild(text);
+
+    svg.appendChild(g);
+  }
+}
+
+function startAutoSpin() {
+  let last = performance.now();
+  function tick(now) {
+    const dt = (now - last) / 1000;
+    last = now;
+    if (view.autoSpin && !view.dragging && view.points3D.length > 0) {
+      view.rotY += dt * 0.25;
+      drawScene();
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+
+function attachPlotInteractions() {
+  const svg = $("plot");
+  svg.style.cursor = "grab";
+  const onDown = e => {
+    view.dragging = true;
+    view.autoSpin = false;
+    const pt = e.touches ? e.touches[0] : e;
+    view.lastX = pt.clientX;
+    view.lastY = pt.clientY;
+    svg.style.cursor = "grabbing";
+  };
+  const onMove = e => {
+    if (!view.dragging) return;
+    const pt = e.touches ? e.touches[0] : e;
+    const dx = pt.clientX - view.lastX;
+    const dy = pt.clientY - view.lastY;
+    view.lastX = pt.clientX;
+    view.lastY = pt.clientY;
+    view.rotY += dx * 0.01;
+    view.rotX += dy * 0.01;
+    view.rotX = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, view.rotX));
+    drawScene();
+    e.preventDefault();
+  };
+  const onUp = () => {
+    view.dragging = false;
+    svg.style.cursor = "grab";
+  };
+  svg.addEventListener("mousedown", onDown);
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  svg.addEventListener("touchstart", onDown, { passive: false });
+  window.addEventListener("touchmove", onMove, { passive: false });
+  window.addEventListener("touchend", onUp);
+  svg.addEventListener("dblclick", () => {
+    view.autoSpin = !view.autoSpin;
+  });
+}
+
+function renderMatrix(words, vecs) {
+  const n = words.length;
+  let html = "<table><thead><tr><th></th>";
+  for (const w of words) html += `<th>${escapeHTML(w)}</th>`;
+  html += "</tr></thead><tbody>";
+  for (let i = 0; i < n; i++) {
+    html += `<tr><th>${escapeHTML(words[i])}</th>`;
+    for (let j = 0; j < n; j++) {
+      if (i === j) {
+        html += `<td class="diag">1.00</td>`;
+      } else {
+        const c = cosine(vecs[i], vecs[j]);
+        const clamped = Math.max(0, Math.min(1, (c + 1) / 2));
+        const hue = 220 - clamped * 220;
+        const bg = `hsl(${hue}, 55%, ${20 + clamped * 30}%)`;
+        html += `<td style="background:${bg}">${c.toFixed(2)}</td>`;
+      }
+    }
+    html += "</tr>";
+  }
+  html += "</tbody></table>";
+  $("matrix").innerHTML = html;
+}
+
+function escapeHTML(s) {
+  return s.replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+async function run() {
+  const raw = $("words").value;
+  const words = raw.split(",").map(w => w.trim()).filter(Boolean);
+  if (words.length < 2) {
+    setStatus("Please enter at least two comma-separated words.");
+    return;
+  }
+  $("go").disabled = true;
+  try {
+    const vecs = await embed(words);
+    setStatus("Running PCA (3 components)...");
+    const m = meanVec(vecs);
+    const Xc = center(vecs, m);
+    const [pc1, pc2, pc3] = topThreePCs(Xc);
+    view.words = words;
+    view.points3D = project3D(Xc, pc1, pc2, pc3);
+    view.autoSpin = true;
+    drawScene();
+    renderMatrix(words, vecs);
+    setStatus(`Done. ${words.length} words embedded. Drag to rotate. Double-click to toggle auto-spin.`);
+  } catch (e) {
+    console.error(e);
+    setStatus("Error: " + (e.message || e));
+  } finally {
+    $("go").disabled = false;
+  }
+}
+
+$("go").addEventListener("click", run);
+$("words").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) run();
+});
+
+attachPlotInteractions();
+drawScene();
+startAutoSpin();
+</script>
+</body>
+</html>
