@@ -2,6 +2,8 @@
 
 A tiny self-contained web page that turns words into 384-dimensional vectors and shows them as 3D arrows you can rotate. Runs entirely in your browser, no API key, no server.
 
+![Screenshot: ten words plotted as 3D arrows from the origin, with a cosine-similarity matrix alongside](docs/screenshot.png)
+
 ## What it does
 
 1. You type a comma-separated list of words.
